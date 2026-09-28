@@ -101,6 +101,16 @@ if __name__ == "__main__":
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
 
+    config.model.recap_enabled = ft_config.recap_stage != "off"
+    if config.model.recap_enabled:
+        config.model.recap_stage = ft_config.recap_stage
+    config.model.recap_alpha = ft_config.recap_alpha
+    config.model.advantage_threshold_percentile = ft_config.advantage_threshold_percentile
+    config.model.advantage_cfg_dropout_prob = ft_config.advantage_cfg_dropout_prob
+    config.model.cfg_guidance_weight = ft_config.cfg_guidance_weight
+    config.model.recap_max_episode_length = ft_config.recap_max_episode_length
+    config.model.recap_c_fail = ft_config.recap_c_fail
+
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
     config.training.optim = "adamw_torch"

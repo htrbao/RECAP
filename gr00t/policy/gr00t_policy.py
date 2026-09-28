@@ -413,8 +413,11 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
         # Step 4: Run model inference to predict actions
+        # `options` is forwarded as-is (e.g. RTC fields, or RECAP's
+        # "cfg_guidance_weight" to override the checkpoint's default
+        # classifier-free guidance weight for this request).
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(**collated_inputs, options=options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units

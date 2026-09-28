@@ -122,6 +122,53 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
+    # --- RECAP (arXiv:2511.14759) advantage conditioning ---
+    recap_enabled: bool = False
+    """Master switch. When False, the model behaves exactly as before RECAP
+    (no value head/advantage token created, single-path forward)."""
+
+    recap_stage: str = "policy"
+    """Which of the two RECAP training stages this run performs, when
+    ``recap_enabled`` is True:
+      - "value_head": Stage 1 (RECAP Eq. 1). Only the value head + advantage
+        embedding train; the rest of the model is frozen.
+      - "policy": Stage 2 (RECAP Eq. 3). The policy trains with advantage
+        conditioning against a frozen value head.
+    """
+
+    recap_alpha: float = 1.0
+    """alpha in RECAP Eq. 3: weight of the advantage-conditioned loss term
+    relative to the unconditional term."""
+
+    advantage_threshold_percentile: float = 0.30
+    """Percentile of predicted values used as the per-batch advantage
+    threshold eps_l (RECAP App. F: 0.30 pre-training, 0.40 fine-tuning)."""
+
+    advantage_cfg_dropout_prob: float = 0.3
+    """Probability of replacing the advantage token with the null token
+    during policy training, so both the conditional and unconditional
+    branches are trained (enables CFG at inference; RECAP App. F)."""
+
+    cfg_guidance_weight: float = 1.0
+    """Classifier-free guidance weight w for inference (RECAP App. E).
+    w=1 samples directly from the advantage-conditioned policy (single
+    forward pass). w>1 amplifies the optimality signal via a second,
+    unconditional forward pass: v_guided = v_null + w * (v_pos - v_null)."""
+
+    value_head_hidden_dim: int = 512
+    value_head_num_heads: int = 8
+    value_head_dropout: float = 0.1
+    value_head_num_bins: int = 201
+    value_loss_coeff: float = 1.0
+
+    recap_max_episode_length: float = 1000.0
+    """Normalisation constant for empirical returns (RECAP Eq. 5, §V-C):
+    an approximate max episode length across tasks used to map return-to-go
+    into (-1, 0) together with ``recap_c_fail``."""
+
+    recap_c_fail: float = 500.0
+    """C_fail in RECAP Eq. 5: penalty added to the return of failed episodes."""
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():

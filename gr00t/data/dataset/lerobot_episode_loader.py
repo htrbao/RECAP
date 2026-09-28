@@ -64,6 +64,14 @@ DEFAULT_COLUMN_NAMES = {
 
 LANG_KEYS = ["task", "sub_task"]
 
+# RECAP (arXiv:2511.14759) reward column. Per-frame, optional: some episodes
+# (e.g. plain demonstrations) legitimately omit it entirely and are treated as
+# successful; a value of -1 anywhere in the episode marks it as a failure.
+# 0 or missing/NaN means success (RECAP Eq. 5's terminal reward, repurposed
+# here as a whole-episode outcome label rather than a strictly-terminal one).
+RECAP_DONE_COLUMN = "next.done"
+RECAP_FAILURE_VALUE = -1.0
+
 
 def _rec_defaultdict() -> defaultdict:
     """Factory that creates an infinitely nestable defaultdict."""
@@ -395,6 +403,14 @@ class LeRobotEpisodeLoader:
             for joint_group in joint_groups_df.columns:
                 loaded_df[f"{modality_type}.{joint_group}"] = joint_groups_df[joint_group]
 
+        # RECAP: pass through the raw outcome column, if this episode's parquet has
+        # it. Left unset (rather than NaN-filled) when absent so __getitem__ can
+        # tell "column missing entirely" apart from "present but null".
+        if RECAP_DONE_COLUMN in original_df.columns:
+            loaded_df["reward.done"] = pd.to_numeric(
+                original_df[RECAP_DONE_COLUMN], errors="coerce"
+            )
+
         return loaded_df
 
     def _load_video_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
@@ -599,6 +615,16 @@ class LeRobotEpisodeLoader:
         # Use actual dataframe length (might be less than nominal)
         actual_length = min(len(df), nominal_length)
         df = df.iloc[:actual_length]
+
+        # RECAP: derive a single episode-level success flag from the raw
+        # "next.done" column (see RECAP_DONE_COLUMN above) and broadcast it
+        # across every row, so any sampled step can read it directly. A
+        # missing column, or one with no -1 anywhere, means success.
+        if "reward.done" in df.columns:
+            episode_success = not bool((df["reward.done"] == RECAP_FAILURE_VALUE).any())
+        else:
+            episode_success = True
+        df = df.assign(**{"reward.episode_success": episode_success})
 
         # Load synchronized video data
         video_data = self._load_video_data(episode_id, np.arange(actual_length))

@@ -30,6 +30,12 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+from gr00t.model.modules.recap import (
+    AdvantageEmbedding,
+    DistributionalValueHead,
+    DistributionalValueHeadConfig,
+    compute_normalised_returns,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -114,9 +120,40 @@ class Gr00tN1d7ActionHead(nn.Module):
             torch.tensor(float(config.noise_beta_beta), dtype=torch.float32, device="cpu"),
         )
         self.num_timestep_buckets = config.num_timestep_buckets
+
+        # --- RECAP (arXiv:2511.14759) advantage conditioning ---
+        self.recap_enabled = config.recap_enabled
+        self._phase = config.recap_stage if config.recap_enabled else "policy"
+        if config.recap_enabled:
+            self.advantage_embedding = AdvantageEmbedding(config.backbone_embedding_dim)
+            self.value_head = DistributionalValueHead(
+                DistributionalValueHeadConfig(
+                    backbone_embedding_dim=config.backbone_embedding_dim,
+                    state_dim=config.max_state_dim * config.state_history_length,
+                    hidden_dim=config.value_head_hidden_dim,
+                    num_heads=config.value_head_num_heads,
+                    dropout=config.value_head_dropout,
+                    num_bins=config.value_head_num_bins,
+                    value_loss_coeff=config.value_loss_coeff,
+                )
+            )
+        else:
+            self.advantage_embedding = None
+            self.value_head = None
+
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
+
+        if config.recap_enabled:
+            if self._phase == "value_head":
+                self.set_phase_value_head()
+            elif self._phase == "policy":
+                self.set_phase_policy()
+            else:
+                raise ValueError(
+                    f"Unknown recap_stage={self._phase!r}; expected 'value_head' or 'policy'"
+                )
 
     def set_trainable_parameters(
         self, tune_projector: bool, tune_diffusion_model: bool, tune_vlln: bool
@@ -148,6 +185,48 @@ class Gr00tN1d7ActionHead(nn.Module):
         if not any(p.requires_grad for p in self.parameters()):
             logger.warning("No action head trainable parameters found.")
 
+    def set_phase_value_head(self):
+        """RECAP Stage 1 (Eq. 1, Algorithm 1 lines 1/4/8): train V on D.
+
+        Everything except the value head + advantage embedding is frozen —
+        the policy (DiT, encoders, decoders, backbone-facing vlln) must stay
+        fixed while the value head is fit.
+        """
+        assert self.recap_enabled, "set_phase_value_head requires config.recap_enabled=True"
+        for p in self.parameters():
+            p.requires_grad = False
+        for p in self.value_head.parameters():
+            p.requires_grad = True
+        for p in self.advantage_embedding.parameters():
+            p.requires_grad = True
+        self._phase = "value_head"
+        logger.info(
+            "[RECAP] Phase 1 (value_head) — trainable params: %d",
+            sum(p.numel() for p in self.parameters() if p.requires_grad),
+        )
+
+    def set_phase_policy(self):
+        """RECAP Stage 2 (Eq. 3, Algorithm 1 lines 2/5/9): train pi on D given
+        the frozen value head V.
+
+        Restores normal policy trainability (tune_projector/tune_diffusion_model/
+        tune_vlln), freezes the value head (used only to label advantages),
+        and keeps the advantage embedding trainable.
+        """
+        assert self.recap_enabled, "set_phase_policy requires config.recap_enabled=True"
+        self.set_trainable_parameters(
+            self.tune_projector, self.tune_diffusion_model, self.tune_vlln
+        )
+        for p in self.value_head.parameters():
+            p.requires_grad = False
+        for p in self.advantage_embedding.parameters():
+            p.requires_grad = True
+        self._phase = "policy"
+        logger.info(
+            "[RECAP] Phase 2 (policy) — trainable params: %d",
+            sum(p.numel() for p in self.parameters() if p.requires_grad),
+        )
+
     def set_frozen_modules_to_eval_mode(self):
         """
         Huggingface will call model.train() at each training_step. To ensure
@@ -166,6 +245,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             if not self.tune_vlln:
                 self.vlln.eval()
                 self.vl_self_attention.eval()
+            if self.recap_enabled and self._phase == "policy":
+                # Value head only labels advantages in the policy phase; never trained here.
+                self.value_head.eval()
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
@@ -178,6 +260,239 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
+
+    def _apply_advantage_conditioning(
+        self,
+        vl_embeds: torch.Tensor,
+        vl_attn_mask: torch.Tensor,
+        image_mask: torch.Tensor | None,
+        advantage_label: torch.Tensor | None,
+        *,
+        force_null: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Append a single advantage token to the VL encoder context (RECAP §V-B).
+
+        Args:
+            vl_embeds: (B, S, backbone_embedding_dim) VL token sequence.
+            vl_attn_mask: (B, S) attention mask over ``vl_embeds``.
+            image_mask: (B, S) bool, True for image tokens, or None when the
+                model doesn't use AlternateVLDiT (mask is unused there).
+            advantage_label: (B,) long in {NEG_IDX, POS_IDX}, or None to force
+                the unconditional (NULL) token for every sample.
+            force_null: If True, ignore ``advantage_label`` and always inject
+                the NULL token (used for the unconditional CFG branch).
+
+        Returns:
+            (vl_embeds_aug, vl_attn_mask_aug, image_mask_aug) each with one
+            extra token appended along the sequence dimension. The appended
+            token is marked as non-image (attended, ``image_mask=False``) so
+            it participates in the text/non-image cross-attention blocks.
+        """
+        B = vl_embeds.shape[0]
+        device = vl_embeds.device
+
+        if advantage_label is None or force_null:
+            labels = torch.full((B,), AdvantageEmbedding.NULL_IDX, dtype=torch.long, device=device)
+        else:
+            labels = advantage_label.to(device=device)
+            if self.training:
+                drop = torch.rand(B, device=device) < self.config.advantage_cfg_dropout_prob
+                labels = labels.masked_fill(drop, AdvantageEmbedding.NULL_IDX)
+
+        adv_token = self.advantage_embedding(labels).to(vl_embeds.dtype)  # (B, 1, D)
+        vl_embeds_aug = torch.cat([vl_embeds, adv_token], dim=1)
+
+        extra_mask = torch.ones(B, 1, dtype=vl_attn_mask.dtype, device=device)
+        vl_attn_mask_aug = torch.cat([vl_attn_mask, extra_mask], dim=1)
+
+        image_mask_aug = None
+        if image_mask is not None:
+            extra_img = torch.zeros(B, 1, dtype=image_mask.dtype, device=device)
+            image_mask_aug = torch.cat([image_mask, extra_img], dim=1)
+
+        return vl_embeds_aug, vl_attn_mask_aug, image_mask_aug
+
+    @torch.no_grad()
+    def compute_advantage_labels(
+        self,
+        backbone_feats: torch.Tensor,
+        state: torch.Tensor,
+        reward: torch.Tensor,
+        percentile: float,
+    ) -> torch.Tensor:
+        """Derive the per-sample advantage indicator I_t from the frozen value head.
+
+        RECAP App. F: eps_l is set at a percentile of the values predicted by
+        the value head over the current batch, so a target fraction of steps
+        get positive advantage. Failure steps (reward < 0) are always labelled
+        NEG regardless of predicted value — failure is never positive advantage.
+
+        Returns:
+            (B,) long tensor in {AdvantageEmbedding.NEG_IDX, AdvantageEmbedding.POS_IDX}.
+        """
+        V = self.value_head.predict_value(backbone_feats, state)  # (B,)
+        epsilon = torch.quantile(V.float(), percentile)
+        is_failure = reward < 0
+        above_threshold = V > epsilon
+        labels = torch.where(
+            above_threshold & ~is_failure,
+            torch.full_like(V, AdvantageEmbedding.POS_IDX, dtype=torch.long),
+            torch.full_like(V, AdvantageEmbedding.NEG_IDX, dtype=torch.long),
+        )
+        return labels
+
+    def forward_value_head(
+        self, backbone_output: BatchFeature, action_input: BatchFeature
+    ) -> BatchFeature:
+        """RECAP Stage 1 forward (Eq. 1): cross-entropy loss for the distributional
+        value head against the discretised empirical return."""
+        self.set_frozen_modules_to_eval_mode()
+        backbone_output = self.process_backbone_output(backbone_output)
+        vl_embeds = backbone_output.backbone_features
+
+        assert "reward" in action_input, (
+            "RECAP value-head training requires 'reward', 'reward.current_frame_idx' and "
+            f"'reward.episode_lengths' in action_input; got keys={list(action_input.keys())}. "
+            "Ensure the dataset has a 'next.done' column (see LeRobotEpisodeLoader)."
+        )
+        reward = action_input["reward"].float()
+        t = action_input["reward.current_frame_idx"].long()
+        episode_lengths = action_input["reward.episode_lengths"].long()
+
+        assert action_input.state.shape[1] == self.config.state_history_length
+        state = action_input.state.reshape(action_input.state.shape[0], -1)
+
+        empirical_return = compute_normalised_returns(
+            success=reward >= 0,
+            episode_lengths=episode_lengths,
+            t=t,
+            max_episode_length=self.config.recap_max_episode_length,
+            c_fail=self.config.recap_c_fail,
+        )
+        value_loss = self.value_head.compute_loss(vl_embeds, state, empirical_return)
+
+        return {
+            "loss": value_loss,
+            "value_loss": value_loss.detach(),
+        }
+
+    def forward_action_head_recap(
+        self, backbone_output: BatchFeature, action_input: BatchFeature
+    ) -> BatchFeature:
+        """RECAP Stage 2 forward (Eq. 3): advantage-conditioned policy training.
+
+            L = || v_theta(a_t | o, l, NULL)   - v ||^2         (unconditional term)
+              + alpha * || v_theta(a_t | o, l, I_t) - v ||^2     (advantage-conditioned term)
+
+        Both terms share the same noised trajectory / velocity target and CFG
+        dropout (config.advantage_cfg_dropout_prob) randomly maps I_t -> NULL in
+        the second term so a single model can be sampled from unconditionally or
+        conditionally at inference time (RECAP App. F).
+        """
+        self.set_frozen_modules_to_eval_mode()
+
+        backbone_output = self.process_backbone_output(backbone_output)
+        vl_embeds = backbone_output.backbone_features
+        device = vl_embeds.device
+        embodiment_id = action_input.embodiment_id
+
+        assert action_input.state.shape[1] == self.config.state_history_length
+        action_input.state = action_input.state.view(action_input.state.shape[0], 1, -1)
+        state_features = self.state_encoder(action_input.state, embodiment_id)
+
+        if self.training and self.state_dropout_prob > 0:
+            do_dropout = (
+                torch.rand(state_features.shape[0], device=state_features.device)
+                < self.state_dropout_prob
+            )
+            do_dropout = do_dropout[:, None, None].to(dtype=state_features.dtype)
+            state_features = state_features * (1 - do_dropout)
+
+        assert "reward" in action_input, (
+            "RECAP policy training requires 'reward' in action_input; got "
+            f"keys={list(action_input.keys())}. Ensure the dataset has a 'next.done' column."
+        )
+        reward = action_input["reward"].float()
+        with torch.no_grad():
+            flat_state = action_input.state.reshape(action_input.state.shape[0], -1)
+            adv_labels = self.compute_advantage_labels(
+                backbone_feats=vl_embeds,
+                state=flat_state,
+                reward=reward,
+                percentile=self.config.advantage_threshold_percentile,
+            )
+        advantage_pos_frac = (adv_labels == AdvantageEmbedding.POS_IDX).float().mean()
+
+        actions = action_input.action
+        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        t = t[:, None, None]
+
+        noisy_trajectory = (1 - t) * noise + t * actions
+        velocity = actions - noise
+
+        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+            action_features = action_features + pos_embs
+
+        sa_embs = torch.cat((state_features, action_features), dim=1)
+        vl_attn_mask = backbone_output.backbone_attention_mask
+        image_mask = backbone_output.image_mask if self.config.use_alternate_vl_dit else None
+        action_mask = action_input.action_mask
+
+        def run_model(vl_e: torch.Tensor, mask_e: torch.Tensor, img_e: torch.Tensor | None):
+            if self.config.use_alternate_vl_dit:
+                model_output, _ = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_e,
+                    encoder_attention_mask=mask_e,
+                    timestep=t_discretized,
+                    return_all_hidden_states=True,
+                    image_mask=img_e,
+                    backbone_attention_mask=mask_e,
+                )
+            else:
+                model_output, _ = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_e,
+                    encoder_attention_mask=mask_e,
+                    timestep=t_discretized,
+                    return_all_hidden_states=True,
+                )
+            pred = self.action_decoder(model_output, embodiment_id)
+            return pred[:, -actions.shape[1] :]
+
+        # Unconditional term: -log pi(a | o, l)
+        vl_null, mask_null, img_null = self._apply_advantage_conditioning(
+            vl_embeds, vl_attn_mask, image_mask, advantage_label=None
+        )
+        pred_null = run_model(vl_null, mask_null, img_null)
+        loss_uncond = F.mse_loss(pred_null, velocity, reduction="none") * action_mask
+        loss_uncond = loss_uncond.sum() / (action_mask.sum() + 1e-6)
+
+        # Advantage-conditioned term: -alpha * log pi(a | I_t, o, l)
+        vl_cond, mask_cond, img_cond = self._apply_advantage_conditioning(
+            vl_embeds, vl_attn_mask, image_mask, advantage_label=adv_labels
+        )
+        pred_cond = run_model(vl_cond, mask_cond, img_cond)
+        loss_cond = F.mse_loss(pred_cond, velocity, reduction="none") * action_mask
+        loss_cond = loss_cond.sum() / (action_mask.sum() + 1e-6)
+
+        total_loss = loss_uncond + self.config.recap_alpha * loss_cond
+
+        return {
+            "loss": total_loss,
+            "action_loss_uncond": loss_uncond.detach(),
+            "action_loss_cond": loss_cond.detach(),
+            "advantage_pos_frac": advantage_pos_frac.detach(),
+            "action_mask": action_mask,
+            "backbone_features": vl_embeds,
+            "state_features": state_features,
+        }
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
@@ -197,6 +512,12 @@ class Gr00tN1d7ActionHead(nn.Module):
             BatchFeature containing:
                 - loss: action prediction loss
         """
+        if self.recap_enabled:
+            if self._phase == "value_head":
+                return self.forward_value_head(backbone_output, action_input)
+            else:
+                return self.forward_action_head_recap(backbone_output, action_input)
+
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
@@ -355,6 +676,36 @@ class Gr00tN1d7ActionHead(nn.Module):
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
 
+        # --- RECAP inference-time advantage conditioning (RECAP App. E) ---
+        # Condition on "Advantage: positive" (beta=1 in Eq. 2). If
+        # cfg_guidance_weight != 1, additionally run an unconditional pass each
+        # denoising step and combine: v_guided = v_null + w * (v_pos - v_null).
+        vl_attn_mask_dit = backbone_output.backbone_attention_mask
+        image_mask_dit = backbone_output.image_mask if self.config.use_alternate_vl_dit else None
+        vl_embeds_uncond = vl_attn_mask_uncond = image_mask_uncond = None
+        cfg_guidance_weight = (
+            options.get("cfg_guidance_weight", self.config.cfg_guidance_weight)
+            if options
+            else self.config.cfg_guidance_weight
+        )
+        use_recap_cfg = self.recap_enabled and cfg_guidance_weight != 1.0
+        if self.recap_enabled:
+            pos_labels = torch.full(
+                (batch_size,), AdvantageEmbedding.POS_IDX, dtype=torch.long, device=device
+            )
+            vl_embeds, vl_attn_mask_dit, image_mask_dit = self._apply_advantage_conditioning(
+                vl_embeds, vl_attn_mask_dit, image_mask_dit, advantage_label=pos_labels
+            )
+            if use_recap_cfg:
+                vl_embeds_uncond, vl_attn_mask_uncond, image_mask_uncond = (
+                    self._apply_advantage_conditioning(
+                        backbone_features,
+                        backbone_output.backbone_attention_mask,
+                        backbone_output.image_mask if self.config.use_alternate_vl_dit else None,
+                        advantage_label=None,
+                    )
+                )
+
         if "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
             # action_horizon is the action horizon of the input action.
@@ -412,22 +763,30 @@ class Gr00tN1d7ActionHead(nn.Module):
             # Join vision, language, state and action embedding along sequence dimension.
             sa_embs = torch.cat((state_features, action_features), dim=1)
 
-            # Run model forward.
-            if self.config.use_alternate_vl_dit:
-                model_output = self.model(
+            def _run_dit(vl_e, mask_e, img_e):
+                if self.config.use_alternate_vl_dit:
+                    return self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_e,
+                        timestep=timesteps_tensor,
+                        image_mask=img_e,
+                        backbone_attention_mask=mask_e,
+                    )
+                return self.model(
                     hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    image_mask=backbone_output.image_mask,
-                    backbone_attention_mask=backbone_output.backbone_attention_mask,
-                )
-            else:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
+                    encoder_hidden_states=vl_e,
                     timestep=timesteps_tensor,
                 )
+
+            model_output = _run_dit(vl_embeds, vl_attn_mask_dit, image_mask_dit)
             pred = self.action_decoder(model_output, embodiment_id)
+
+            if use_recap_cfg:
+                model_output_uncond = _run_dit(
+                    vl_embeds_uncond, vl_attn_mask_uncond, image_mask_uncond
+                )
+                pred_uncond = self.action_decoder(model_output_uncond, embodiment_id)
+                pred = pred_uncond + cfg_guidance_weight * (pred - pred_uncond)
 
             pred_velocity = pred[:, -self.action_horizon :]
 
@@ -437,7 +796,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         return BatchFeature(
             data={
                 "action_pred": actions,
-                "backbone_features": vl_embeds,
+                "backbone_features": backbone_features,
                 "state_features": state_features,
             }
         )

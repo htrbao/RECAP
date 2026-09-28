@@ -89,6 +89,17 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
+                # RECAP: these must be passed explicitly so a checkpoint saved
+                # before RECAP was enabled (or from a different stage) doesn't
+                # silently keep its own saved values instead of the CLI's.
+                recap_enabled=self.config.model.recap_enabled,
+                recap_stage=self.config.model.recap_stage,
+                recap_alpha=self.config.model.recap_alpha,
+                advantage_threshold_percentile=self.config.model.advantage_threshold_percentile,
+                advantage_cfg_dropout_prob=self.config.model.advantage_cfg_dropout_prob,
+                cfg_guidance_weight=self.config.model.cfg_guidance_weight,
+                recap_max_episode_length=self.config.model.recap_max_episode_length,
+                recap_c_fail=self.config.model.recap_c_fail,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -105,7 +116,17 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+            # RECAP's value_head/advantage_embedding are new submodules: when
+            # starting Stage 1 from a plain (pre-RECAP) checkpoint they are
+            # legitimately absent and freshly initialized, same treatment as
+            # mask_token above.
+            other_missing = [
+                k
+                for k in missing_keys
+                if "mask_token" not in k
+                and "value_head" not in k
+                and "advantage_embedding" not in k
+            ]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")

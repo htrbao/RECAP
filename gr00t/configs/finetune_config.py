@@ -15,6 +15,7 @@
 
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
+from typing import Literal
 import warnings
 
 
@@ -195,6 +196,46 @@ class FinetuneConfig:
     """If True, skip loading model weights from base_model_path (architecture only).
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
+
+    # --- RECAP (arXiv:2511.14759) advantage conditioning ---
+    recap_stage: Literal["off", "value_head", "policy"] = "off"
+    """RECAP training stage:
+      - "off": regular training, unchanged from before RECAP.
+      - "value_head": Stage 1 (RECAP Eq. 1). Trains only the distributional
+        value head + advantage embedding on a dataset carrying a "next.done"
+        outcome column; everything else is frozen. Run this first, from your
+        current base checkpoint.
+      - "policy": Stage 2 (RECAP Eq. 3). Trains the policy with advantage
+        conditioning, using the frozen value head from Stage 1. Point
+        --base-model-path at the Stage 1 output checkpoint.
+    """
+
+    recap_alpha: float = 1.0
+    """alpha in RECAP Eq. 3: weight of the advantage-conditioned loss term
+    relative to the unconditional term. Only used when recap_stage=policy."""
+
+    advantage_threshold_percentile: float = 0.30
+    """Percentile of predicted values used as the advantage threshold eps_l
+    (RECAP App. F: 0.30 pre-training / first pass, 0.40 on subsequent
+    fine-tuning iterations with more on-policy data)."""
+
+    advantage_cfg_dropout_prob: float = 0.3
+    """Probability of dropping the advantage token to the null token during
+    Stage 2 training, so the model can also be sampled from unconditionally
+    (enables classifier-free guidance at inference; RECAP App. F)."""
+
+    cfg_guidance_weight: float = 1.0
+    """Default inference-time classifier-free guidance weight w (RECAP App. E).
+    w=1 samples directly from the advantage-conditioned policy. w>1 runs an
+    extra unconditional forward pass per denoising step and amplifies the
+    optimality signal; useful range ~[1.5, 2.5]."""
+
+    recap_max_episode_length: float = 1000.0
+    """Normalisation constant for empirical returns (RECAP Eq. 5, §V-C): an
+    approximate max episode length for the target task(s)."""
+
+    recap_c_fail: float = 500.0
+    """C_fail in RECAP Eq. 5: penalty added to the return of failed episodes."""
 
     def __post_init__(self) -> None:
         if self.gradient_accumulation_steps < 1:

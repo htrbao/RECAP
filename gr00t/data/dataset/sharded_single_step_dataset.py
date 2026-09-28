@@ -68,6 +68,19 @@ def extract_step_data(
     assert len(language_data) == 1, f"Expected 1 language, got {len(language_data)}"
     text = language_data[list(language_data.keys())[0]][0]
 
+    # RECAP (arXiv:2511.14759): episode-level success/failure outcome, broadcast
+    # by LeRobotEpisodeLoader onto every row as "reward.episode_success". Always
+    # populated (defaulting to success) so downstream RECAP training doesn't
+    # need every dataset to carry the "next.done" column.
+    episode_success = True
+    if "reward.episode_success" in episode_data.columns:
+        episode_success = bool(episode_data["reward.episode_success"].iloc[0])
+    metadata = {
+        "reward": 0.0 if episode_success else -1.0,
+        "reward.current_frame_idx": step_index,
+        "reward.episode_lengths": len(episode_data),
+    }
+
     vla_step_data = VLAStepData(
         images=video_data,
         masks=mask_data if mask_data else None,
@@ -75,6 +88,7 @@ def extract_step_data(
         actions=action_data,
         text=text,
         embodiment=embodiment_tag,
+        metadata=metadata,
     )
     return vla_step_data
 

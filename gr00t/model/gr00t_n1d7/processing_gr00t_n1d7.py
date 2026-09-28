@@ -698,6 +698,24 @@ class Gr00tN1d7Processor(BaseProcessor):
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
+
+        # RECAP (arXiv:2511.14759): pass through the reward/episode-position
+        # metadata populated by ShardedSingleStepDataset.extract_step_data, when
+        # present. Harmless to include unconditionally — the non-RECAP action
+        # head forward simply never reads these keys.
+        if content.metadata:
+            if "reward" in content.metadata:
+                transformed_inputs["reward"] = torch.tensor(
+                    content.metadata["reward"], dtype=torch.float32
+                )
+            if "reward.current_frame_idx" in content.metadata:
+                transformed_inputs["reward.current_frame_idx"] = torch.tensor(
+                    content.metadata["reward.current_frame_idx"], dtype=torch.int64
+                )
+            if "reward.episode_lengths" in content.metadata:
+                transformed_inputs["reward.episode_lengths"] = torch.tensor(
+                    content.metadata["reward.episode_lengths"], dtype=torch.int64
+                )
         return transformed_inputs
 
     def _get_vlm_inputs(
