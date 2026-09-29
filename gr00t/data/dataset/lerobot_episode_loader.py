@@ -56,7 +56,7 @@ LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILE_NAME = "stats.json"
 LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 
-ALLOWED_MODALITIES = ["video", "state", "action", "language", "mask"]
+ALLOWED_MODALITIES = ["video", "state", "action", "language", "mask", "reward"]
 DEFAULT_COLUMN_NAMES = {
     "state": "observation.state",
     "action": "action",
@@ -306,6 +306,17 @@ class LeRobotEpisodeLoader:
 
         return modality_configs
 
+    def _reward_column(self) -> str:
+        """Resolve the raw dataframe column holding the per-frame RECAP outcome signal.
+
+        Defaults to RECAP_DONE_COLUMN ("next.done"), but a dataset can override it via
+        a "reward" section in its modality.json, e.g.:
+            {"reward": {"current": {"original_key": "next.reward"}}}
+        for datasets that log the same success/failure signal under a different column.
+        """
+        reward_meta = self.modality_meta.get("reward", {}).get("current", {})
+        return reward_meta.get("original_key", RECAP_DONE_COLUMN)
+
     def __len__(self) -> int:
         """Return number of episodes in dataset."""
         return len(self.episodes_metadata)
@@ -405,11 +416,13 @@ class LeRobotEpisodeLoader:
 
         # RECAP: pass through the raw outcome column, if this episode's parquet has
         # it. Left unset (rather than NaN-filled) when absent so __getitem__ can
-        # tell "column missing entirely" apart from "present but null".
-        if RECAP_DONE_COLUMN in original_df.columns:
-            loaded_df["reward.done"] = pd.to_numeric(
-                original_df[RECAP_DONE_COLUMN], errors="coerce"
-            )
+        # tell "column missing entirely" apart from "present but null". The column
+        # name defaults to RECAP_DONE_COLUMN but can be overridden per-dataset via a
+        # "reward" section in modality.json (e.g. {"current": {"original_key": "next.reward"}}),
+        # for datasets that log the same success/failure signal under a different name.
+        reward_column = self._reward_column()
+        if reward_column in original_df.columns:
+            loaded_df["reward.done"] = pd.to_numeric(original_df[reward_column], errors="coerce")
 
         return loaded_df
 

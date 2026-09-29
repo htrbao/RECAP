@@ -50,6 +50,7 @@ class EmbodimentTag(Enum):
     - NEW_EMBODIMENT        -> "new_embodiment"
     - ROBOCASA_PANDA_OMRON  -> "robocasa_panda_omron"
     - ROBOCASA_GR1_TABLETOP -> "robocasa_gr1_tabletop"
+    - VFE_RECAP             -> "vfe_recap"
 
     Use ``EmbodimentTag.resolve(s)`` to look up a tag by name or value,
     case-insensitively.
@@ -142,6 +143,12 @@ class EmbodimentTag(Enum):
     Uses the custom-embodiment finetuning projector slot.
     """
 
+    VFE_RECAP = "vfe_recap"
+    """
+    Bimanual VFE robot (dual arm + dual hand) configured for RECAP advantage-conditioned
+    training, with a "reward" modality wired to the dataset's per-frame outcome column.
+    """
+
     @classmethod
     def resolve(cls, tag: "str | EmbodimentTag") -> "EmbodimentTag":
         """Resolve a string to an EmbodimentTag, case-insensitively.
@@ -219,6 +226,7 @@ FINETUNE_ONLY_TAGS: frozenset[EmbodimentTag] = frozenset(
         EmbodimentTag.NEW_EMBODIMENT,
         EmbodimentTag.ROBOCASA_PANDA_OMRON,
         EmbodimentTag.ROBOCASA_GR1_TABLETOP,
+        EmbodimentTag.VFE_RECAP,
     }
 )
 """Tags for custom robots (finetuning only, not in any shipped checkpoint)."""
