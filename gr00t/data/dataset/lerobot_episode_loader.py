@@ -56,7 +56,15 @@ LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILE_NAME = "stats.json"
 LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 
-ALLOWED_MODALITIES = ["video", "state", "action", "language", "mask", "reward"]
+ALLOWED_MODALITIES = ["video", "state", "action", "language", "mask"]
+# NOTE: "reward" is intentionally not an allowed ModalityConfig key. It isn't a
+# per-step, column-per-key modality like the ones above — RECAP's outcome signal
+# is derived automatically (see _reward_column() and "reward.episode_success"
+# below) regardless of what's declared here. Adding "reward" to this list would
+# let a ModalityConfig with a "reward" entry survive filtering, and the generic
+# per-step extraction in sharded_single_step_dataset.extract_step_data() would
+# then look for a literal "reward.<key>" dataframe column that's never populated,
+# crashing with a KeyError partway through training.
 DEFAULT_COLUMN_NAMES = {
     "state": "observation.state",
     "action": "action",

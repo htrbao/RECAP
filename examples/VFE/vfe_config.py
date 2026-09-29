@@ -55,15 +55,19 @@ so100_config = {
 register_modality_config(so100_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)
 
 
-# Bimanual VFE robot (dual arm + dual hand), configured for RECAP advantage-conditioned
-# training. Matches the dataset's meta/modality.json layout, e.g.:
-#   "state":  {"left_arm": {...}, "right_arm": {...}, "left_hand": {...}, "right_hand": {...}}
-#   "action": {"left_arm": {...}, "right_arm": {...}, "left_hand": {...}, "right_hand": {...}}
+# VFE robot, configured for RECAP advantage-conditioned training. Matches the
+# dataset's meta/modality.json layout, e.g.:
+#   "state":  {"left_arm": {...}, "left_hand": {...}}
+#   "action": {"left_arm": {...}, "left_hand": {...}}
 #   "video":  {"cam_front": {...}, "cam_outside": {...}}
-#   "reward": {"current": {"original_key": "next.reward"}}
-# The "reward" key opts this config into RECAP: LeRobotEpisodeLoader reads its
-# original_key from modality.json as the per-frame success/failure column, instead
-# of the default "next.done".
+#
+# RECAP itself needs no "reward" entry here: the per-frame outcome column is
+# read directly from the dataset's meta/modality.json by LeRobotEpisodeLoader
+# (see _reward_column(), which honors a "reward": {"current": {"original_key":
+# "next.reward"}} section there, falling back to "next.done"). Declaring a
+# "reward" ModalityConfig key in this dict would instead make the generic
+# per-step extraction in extract_step_data() look for a literal "reward.current"
+# dataframe column, which is never populated, and crash with a KeyError.
 vfe_recap_config = {
     "video": ModalityConfig(
         delta_indices=[0],
@@ -100,12 +104,6 @@ vfe_recap_config = {
     "language": ModalityConfig(
         delta_indices=[0],
         modality_keys=["annotation.human.task_description"],
-    ),
-    # RECAP: per-frame outcome signal. modality_keys=["current"] pairs with
-    # modality.json's "reward.current.original_key" to locate the raw column.
-    "reward": ModalityConfig(
-        delta_indices=[0],
-        modality_keys=["current"],
     ),
 }
 
