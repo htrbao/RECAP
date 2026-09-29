@@ -350,6 +350,15 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output = self.process_backbone_output(backbone_output)
         vl_embeds = backbone_output.backbone_features
 
+        if logger.isEnabledFor(logging.DEBUG):
+            with torch.no_grad():
+                logger.debug(
+                    "[RECAP value_head] vl_embeds stats: "
+                    f"abs_max={vl_embeds.abs().max().item():.3g} "
+                    f"abs_mean={vl_embeds.abs().mean().item():.3g} "
+                    f"std={vl_embeds.float().std().item():.3g}"
+                )
+
         assert "reward" in action_input, (
             "RECAP value-head training requires 'reward', 'reward.current_frame_idx' and "
             f"'reward.episode_lengths' in action_input; got keys={list(action_input.keys())}. "

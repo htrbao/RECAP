@@ -170,6 +170,15 @@ class FinetuneConfig:
     warmup_ratio: float = 0.05
     """Proportion of total training steps used for learning rate warm-up."""
 
+    max_grad_norm: float = 1.0
+    """Gradient clipping threshold. Gradients are clipped to this L2 norm before
+    every optimizer step; the pre-clip norm is what gets reported as `grad_norm`
+    in training logs, so a large logged value doesn't by itself mean an unclipped
+    update was applied. Lower this (e.g. 0.1-0.5) to more aggressively bound
+    updates for a freshly-initialized head (e.g. RECAP's value_head in Stage 1)
+    seeing large or poorly-conditioned frozen backbone features for the first
+    time."""
+
     ds_weights_alpha: float | None = None
     """Power-law exponent for dataset soup weighting. When set, each dataset's
     sampling weight is len(dataset)^alpha and per-dataset mix_ratio values are ignored."""

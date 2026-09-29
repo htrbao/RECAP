@@ -126,6 +126,7 @@ if __name__ == "__main__":
     config.training.max_steps = ft_config.max_steps
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio
+    config.training.max_grad_norm = ft_config.max_grad_norm
     config.training.wandb_project = ft_config.wandb_project
 
     config.data.shard_size = ft_config.shard_size
