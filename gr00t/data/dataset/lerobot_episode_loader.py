@@ -629,10 +629,12 @@ class LeRobotEpisodeLoader:
         actual_length = min(len(df), nominal_length)
         df = df.iloc[:actual_length]
 
-        # RECAP: derive a single episode-level success flag from the raw
-        # "next.done" column (see RECAP_DONE_COLUMN above) and broadcast it
-        # across every row, so any sampled step can read it directly. A
-        # missing column, or one with no -1 anywhere, means success.
+        # RECAP: derive a single episode-level success flag from the raw outcome
+        # column (see _reward_column() above) and broadcast it across every row,
+        # so any sampled step can read it directly. A dataset that never carries
+        # this column (e.g. a demonstration-only, all-successful dataset with no
+        # "reward" section in its modality.json) or one with no failure value
+        # anywhere is treated as success.
         if "reward.done" in df.columns:
             episode_success = not bool((df["reward.done"] == RECAP_FAILURE_VALUE).any())
         else:
